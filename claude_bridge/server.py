@@ -467,8 +467,14 @@ def _is_json_str(s: str) -> bool:
         return False
 
 
-def _message_record(row: sqlite3.Row, channel: str) -> dict[str, Any]:
-    """Convert a stored row into a stable, machine-readable representation."""
+def _message_record(
+    row: sqlite3.Row, channel: str, *, compact: bool = False
+) -> dict[str, Any]:
+    """Convert a stored row into a stable, machine-readable representation.
+
+    ``compact`` leaves out the raw ``content`` of a structured message, whose
+    parsed ``message`` carries the same data.
+    """
     parsed = parse_message_content(row["content"])
     result: dict[str, Any] = {
         "seq": int(row["seq"]),
@@ -481,6 +487,8 @@ def _message_record(row: sqlite3.Row, channel: str) -> dict[str, Any]:
     }
     if parsed.envelope is not None:
         result["message"] = parsed.envelope.to_dict()
+        if compact:
+            del result["content"]
     elif parsed.error:
         result["parse_warning"] = parsed.error
     return result
@@ -1552,6 +1560,14 @@ async def list_tools() -> list[Tool]:
                     "since_seq": {"type": "integer", "minimum": 0},
                     "consumer_id": {"type": "string", "minLength": 1},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
+                    "compact": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Return a structured message once (parsed message, "
+                            "no raw content string)"
+                        ),
+                    },
                 },
                 "required": ["channel"],
                 "additionalProperties": False,
@@ -1580,6 +1596,14 @@ async def list_tools() -> list[Tool]:
                     "consumer_id": {"type": "string", "minLength": 1},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
                     "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 55, "default": 20},
+                    "compact": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Return a structured message once (parsed message, "
+                            "no raw content string)"
+                        ),
+                    },
                 },
                 "required": ["channel"],
                 "anyOf": [
@@ -2181,9 +2205,10 @@ def _channel_read_data(
     """Structured result of one channel read; the cursors resume after its last row."""
     since_id = arguments.get("since_id")
     since_seq = arguments.get("since_seq")
+    compact = bool(arguments.get("compact"))
     return {
         "channel": channel,
-        "messages": [_message_record(row, channel) for row in rows],
+        "messages": [_message_record(row, channel, compact=compact) for row in rows],
         "next_cursor": rows[-1]["id"] if rows else since_id,
         "next_seq": int(rows[-1]["seq"]) if rows else since_seq,
         "consumer_id": arguments.get("consumer_id"),
