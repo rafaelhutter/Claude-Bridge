@@ -198,6 +198,7 @@ _TASK_ADDED_COLUMNS = {
     "notes_read_seq": "INTEGER NOT NULL DEFAULT 0",
     "title": "TEXT",
     "assignee": "TEXT",
+    "progress": "TEXT",
 }
 
 
@@ -269,6 +270,7 @@ def ensure_taskqueue_schema(conn: sqlite3.Connection) -> None:
                 notes_read_seq   INTEGER NOT NULL DEFAULT 0,
                 title            TEXT,
                 assignee         TEXT,
+                progress         TEXT,
                 created_at       TEXT    NOT NULL,
                 updated_at       TEXT    NOT NULL,
                 CHECK (
@@ -356,6 +358,7 @@ class Task:
     created_at: str
     updated_at: str
     assignee: str | None  # Only this consumer may claim; None means any worker.
+    progress: str | None  # The worker's latest status line; never an error.
 
 
 @dataclass(frozen=True, slots=True)
@@ -992,6 +995,7 @@ def task_to_dict(task: Task, *, include_payload: bool = True) -> dict:
         "enqueued_by": task.enqueued_by,
         "worked_by": task.worked_by,
         "assignee": task.assignee,
+        "progress": task.progress,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
     }

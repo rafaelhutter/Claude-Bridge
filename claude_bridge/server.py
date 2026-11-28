@@ -79,6 +79,8 @@ from .participants import (
     overview_to_dict,
     parse_usage_report,
 )
+from .task_leases import extend_lease, release_task
+from .task_progress import set_progress
 from .taskqueue import (
     KEEP_ASSIGNEE,
     MAX_NOTE_BYTES,
@@ -1160,14 +1162,71 @@ async def fail_task_reliable(
     return outcome
 
 
+async def release_task_reliable(
+    *,
+    channel: str,
+    task_id: str,
+    lease_token: str,
+    delay_seconds: int = 0,
+    progress: str | None = None,
+) -> TaskWithNotes:
+    def release_and_record():
+        task = release_task(
+            task_store(),
+            channel=channel,
+            task_id=task_id,
+            lease_token=lease_token,
+            delay_seconds=delay_seconds,
+            progress=progress,
+        )
+        _record_task_resolution(task)
+        return TaskWithNotes(task, task_store().unread_notes(task))
+
+    outcome = await _write_transaction(release_and_record)
+    await _notify_task_waiters()
+    return outcome
+
+
+async def extend_lease_reliable(
+    *,
+    channel: str,
+    task_id: str,
+    lease_token: str,
+    lease_seconds: int,
+    progress: str | None = None,
+) -> TaskWithNotes:
+    def extend_and_record():
+        task = extend_lease(
+            task_store(),
+            channel=channel,
+            task_id=task_id,
+            lease_token=lease_token,
+            lease_seconds=lease_seconds,
+            progress=progress,
+        )
+        participant_store().touch(task.lease_owner)
+        return TaskWithNotes(task, task_store().unread_notes(task))
+
+    return await _write_transaction(extend_and_record)
+
+
 async def add_task_note_reliable(
-    *, channel: str, task_id: str, sender: str, content: str
+    *,
+    channel: str,
+    task_id: str,
+    sender: str,
+    content: str,
+    progress: str | None = None,
 ) -> TaskNote:
     # No waiter wake-up: claim long-polls wait for new tasks, and a note adds none.
     def add_and_record():
         note = task_store().add_note(
             channel=channel, task_id=task_id, sender=sender, content=content
         )
+        if progress is not None:
+            set_progress(
+                task_store(), channel=note.channel, task_id=task_id, progress=progress
+            )
         participant_store().touch(note.sender)
         return note
 
@@ -1760,6 +1819,84 @@ async def list_tools() -> list[Tool]:
             ),
         ),
         Tool(
+            name="bridge_release",
+            description=(
+                "Give a claimed task back to the queue untouched, e.g. it is meant for "
+                "another worker or this worker cannot start it now. Unlike bridge_fail "
+                "it is no failure: the claim's attempt is refunded and last_error stays. "
+                "Optional delay_seconds before it is claimable again. Requires the "
+                "lease_token from bridge_claim."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "minLength": 1},
+                    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "lease_token": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "delay_seconds": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1000000000,
+                        "default": 0,
+                    },
+                    "progress": {
+                        "type": "string",
+                        "maxLength": 300,
+                        "description": (
+                            "One-line task status shown in bridge_tasks (not an "
+                            "error); empty string clears it"
+                        ),
+                    },
+                },
+                "required": ["channel", "task_id", "lease_token"],
+                "additionalProperties": False,
+            },
+            outputSchema=object_output,
+            annotations=ToolAnnotations(
+                title="Release task",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=False,
+            ),
+        ),
+        Tool(
+            name="bridge_extend",
+            description=(
+                "Heartbeat for a claimed task: move its lease expiry to lease_seconds "
+                "from now (default and cap as for bridge_claim) without a new claim, "
+                "so long work keeps its lease and uses no attempt. Returns the unread "
+                "notes without marking them read. Requires the lease_token."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "minLength": 1},
+                    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "lease_token": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "lease_seconds": {"type": "integer", "minimum": 1},
+                    "progress": {
+                        "type": "string",
+                        "maxLength": 300,
+                        "description": (
+                            "One-line task status shown in bridge_tasks (not an "
+                            "error); empty string clears it"
+                        ),
+                    },
+                },
+                "required": ["channel", "task_id", "lease_token"],
+                "additionalProperties": False,
+            },
+            outputSchema=object_output,
+            annotations=ToolAnnotations(
+                title="Extend lease",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        ),
+        Tool(
             name="bridge_replace",
             description=(
                 "Replace the payload of a pending task in place (same task_id and "
@@ -1892,6 +2029,14 @@ async def list_tools() -> list[Tool]:
                     "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
                     "sender": {"type": "string", "minLength": 1, "maxLength": 128},
                     "content": {"type": "string", "minLength": 1},
+                    "progress": {
+                        "type": "string",
+                        "maxLength": 300,
+                        "description": (
+                            "One-line task status shown in bridge_tasks (not an "
+                            "error); empty string clears it"
+                        ),
+                    },
                 },
                 "required": ["channel", "task_id", "sender", "content"],
                 "additionalProperties": False,
@@ -2354,6 +2499,52 @@ async def dispatch_tool(
             structured=structured,
         )
 
+    # ── bridge_release ───────────────────────────────────────────────────────
+    elif name == "bridge_release":
+        channel = validate_channel(arguments["channel"])
+        with _task_errors_as_validation():
+            outcome = await release_task_reliable(
+                channel=channel,
+                task_id=arguments["task_id"],
+                lease_token=arguments["lease_token"],
+                delay_seconds=arguments.get("delay_seconds", 0),
+                progress=arguments.get("progress"),
+            )
+        task, unread = outcome.task, outcome.notes
+        return _tool_output(
+            f"✓ Released task {task.id} on [{channel}] "
+            f"(pending, attempt {task.attempts}/{task.max_attempts})"
+            + _notes_text("unread notes", unread),
+            {
+                **task_to_dict(task, include_payload=False),
+                "unread_notes": notes_to_dicts(unread),
+            },
+            structured=structured,
+        )
+
+    # ── bridge_extend ────────────────────────────────────────────────────────
+    elif name == "bridge_extend":
+        channel = validate_channel(arguments["channel"])
+        with _task_errors_as_validation():
+            outcome = await extend_lease_reliable(
+                channel=channel,
+                task_id=arguments["task_id"],
+                lease_token=arguments["lease_token"],
+                lease_seconds=_clamp_lease_seconds(arguments.get("lease_seconds")),
+                progress=arguments.get("progress"),
+            )
+        task, unread = outcome.task, outcome.notes
+        return _tool_output(
+            f"✓ Extended lease on task {task.id} on [{channel}] "
+            f"until {task.lease_expires_at}"
+            + _notes_text("unread notes", unread),
+            {
+                **task_to_dict(task, include_payload=False),
+                "unread_notes": notes_to_dicts(unread),
+            },
+            structured=structured,
+        )
+
     # ── bridge_replace ───────────────────────────────────────────────────────
     elif name == "bridge_replace":
         channel = validate_channel(arguments["channel"])
@@ -2409,6 +2600,7 @@ async def dispatch_tool(
                 f"  {t.id} · {t.status.value} · attempt {t.attempts}/{t.max_attempts}"
                 + (f" · for {t.assignee}" if t.assignee else "")
                 + (f" · {t.title}" if t.title else "")
+                + (f" · progress: {t.progress}" if t.progress else "")
             )
         return _tool_output(
             "\n".join(lines),
@@ -2428,6 +2620,7 @@ async def dispatch_tool(
                 task_id=arguments["task_id"],
                 sender=arguments["sender"],
                 content=arguments["content"],
+                progress=arguments.get("progress"),
             )
         return _tool_output(
             f"✓ Noted task {note.task_id} on [{note.channel}] (note seq {note.seq})",
