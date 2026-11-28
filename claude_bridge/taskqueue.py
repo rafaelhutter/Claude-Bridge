@@ -358,7 +358,7 @@ class Task:
     created_at: str
     updated_at: str
     assignee: str | None  # Only this consumer may claim; None means any worker.
-    progress: str | None  # The worker's latest status line; never an error.
+    progress: str | None  # Status line of the current or last lease; never an error.
 
 
 @dataclass(frozen=True, slots=True)
@@ -600,6 +600,7 @@ class TaskStore:
             self.conn.execute(
                 "UPDATE tasks SET status = 'claimed', lease_owner = ?, worked_by = ?, "
                 "lease_token = ?, lease_expires_at = ?, attempts = attempts + 1, "
+                "progress = NULL, "
                 "notes_read_seq = (SELECT COALESCE(MAX(seq), 0) FROM task_notes "
                 "WHERE task_notes.task_id = tasks.id), "
                 "updated_at = ? WHERE seq = ? AND status = 'pending'",
@@ -816,6 +817,7 @@ class TaskStore:
                 "priority = COALESCE(?, priority), "
                 "available_at = COALESCE(?, available_at), attempts = 0, "
                 "assignee = CASE WHEN ? THEN assignee ELSE ? END, "
+                "progress = NULL, "
                 "last_error = NULL, updated_at = ? WHERE seq = ?",
                 (
                     payload,

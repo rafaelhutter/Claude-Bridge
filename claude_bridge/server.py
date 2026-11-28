@@ -1109,7 +1109,7 @@ async def _claim_task_once(
 
 
 def _record_task_resolution(task) -> None:
-    """After complete/fail: the worker was active and no longer holds the task."""
+    """After complete/fail/release: the worker was active and holds the task no more."""
     participants = participant_store()
     if task.worked_by is not None:  # A lease taken before worked_by existed.
         participants.touch(task.worked_by)
@@ -1542,6 +1542,14 @@ async def list_tools() -> list[Tool]:
             "additionalProperties": False,
         },
     }
+    progress_input = {
+        "type": "string",
+        "maxLength": 300,
+        "description": (
+            "One-line task status shown in bridge_tasks (not an error); a new "
+            "claim clears it, and so does an empty string"
+        ),
+    }
     return [
         Tool(
             name="bridge_send",
@@ -1920,14 +1928,7 @@ async def list_tools() -> list[Tool]:
                         "maximum": 1000000000,
                         "default": 0,
                     },
-                    "progress": {
-                        "type": "string",
-                        "maxLength": 300,
-                        "description": (
-                            "One-line task status shown in bridge_tasks (not an "
-                            "error); empty string clears it"
-                        ),
-                    },
+                    "progress": progress_input,
                 },
                 "required": ["channel", "task_id", "lease_token"],
                 "additionalProperties": False,
@@ -1956,14 +1957,7 @@ async def list_tools() -> list[Tool]:
                     "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
                     "lease_token": {"type": "string", "minLength": 1, "maxLength": 256},
                     "lease_seconds": {"type": "integer", "minimum": 1},
-                    "progress": {
-                        "type": "string",
-                        "maxLength": 300,
-                        "description": (
-                            "One-line task status shown in bridge_tasks (not an "
-                            "error); empty string clears it"
-                        ),
-                    },
+                    "progress": progress_input,
                 },
                 "required": ["channel", "task_id", "lease_token"],
                 "additionalProperties": False,
@@ -2128,14 +2122,7 @@ async def list_tools() -> list[Tool]:
                     "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
                     "sender": {"type": "string", "minLength": 1, "maxLength": 128},
                     "content": {"type": "string", "minLength": 1},
-                    "progress": {
-                        "type": "string",
-                        "maxLength": 300,
-                        "description": (
-                            "One-line task status shown in bridge_tasks (not an "
-                            "error); empty string clears it"
-                        ),
-                    },
+                    "progress": progress_input,
                 },
                 "required": ["channel", "task_id", "sender", "content"],
                 "additionalProperties": False,
@@ -2294,6 +2281,18 @@ def _channels_output(
     if waited:
         data["timed_out"] = not any(rows for _cursor, rows in reads)
     return _tool_output("\n\n".join(texts), data, structured=structured)
+def _held_task_output(
+    outcome: TaskWithNotes, headline: str, *, structured: bool
+) -> list[TextContent] | tuple[list[TextContent], dict[str, Any]]:
+    """Result of a lease operation: the task plus the notes its worker has not read."""
+    return _tool_output(
+        headline + _notes_text("unread notes", outcome.notes),
+        {
+            **task_to_dict(outcome.task, include_payload=False),
+            "unread_notes": notes_to_dicts(outcome.notes),
+        },
+        structured=structured,
+    )
 
 
 def _task_payload(arguments: dict[str, Any]) -> str:
@@ -2667,15 +2666,10 @@ async def dispatch_tool(
                 delay_seconds=arguments.get("delay_seconds", 0),
                 progress=arguments.get("progress"),
             )
-        task, unread = outcome.task, outcome.notes
-        return _tool_output(
-            f"✓ Released task {task.id} on [{channel}] "
-            f"(pending, attempt {task.attempts}/{task.max_attempts})"
-            + _notes_text("unread notes", unread),
-            {
-                **task_to_dict(task, include_payload=False),
-                "unread_notes": notes_to_dicts(unread),
-            },
+        return _held_task_output(
+            outcome,
+            f"✓ Released task {outcome.task.id} on [{channel}] (pending, attempt "
+            f"{outcome.task.attempts}/{outcome.task.max_attempts})",
             structured=structured,
         )
 
@@ -2690,15 +2684,10 @@ async def dispatch_tool(
                 lease_seconds=_clamp_lease_seconds(arguments.get("lease_seconds")),
                 progress=arguments.get("progress"),
             )
-        task, unread = outcome.task, outcome.notes
-        return _tool_output(
-            f"✓ Extended lease on task {task.id} on [{channel}] "
-            f"until {task.lease_expires_at}"
-            + _notes_text("unread notes", unread),
-            {
-                **task_to_dict(task, include_payload=False),
-                "unread_notes": notes_to_dicts(unread),
-            },
+        return _held_task_output(
+            outcome,
+            f"✓ Extended lease on task {outcome.task.id} on [{channel}] "
+            f"until {outcome.task.lease_expires_at}",
             structured=structured,
         )
 
