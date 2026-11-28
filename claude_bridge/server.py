@@ -78,6 +78,7 @@ from .participants import (
     overview_to_dict,
     parse_usage_report,
 )
+from .multi_channel import MAX_CHANNELS, ChannelCursor, parse_channel_cursors
 from .message_cursors import (
     resolve_message_cursor,
     stale_cursor_error,
@@ -558,23 +559,37 @@ async def _wait_channel_rows(
             "required",
             "bridge_wait requires since_id, since_seq or consumer_id",
         )
+    return await _wait_until_ready(
+        lambda: _read_channel_rows(
+            channel,
+            since_id=since_id,
+            consumer_id=consumer_id,
+            limit=limit,
+            since_seq=since_seq,
+        ),
+        lambda read: bool(read[0] or read[1]),
+        timeout_seconds,
+    )
+
+
+_Read = TypeVar("_Read")
+
+
+async def _wait_until_ready(
+    read: Callable[[], _Read],
+    is_ready: Callable[[_Read], bool],
+    timeout_seconds: float,
+) -> _Read:
+    """Repeat ``read`` on new messages until it is ready or the timeout passes."""
     timeout_seconds = max(0.0, min(float(timeout_seconds), 55.0))
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     condition = _message_condition_for_current_loop()
     async with condition:
         while True:
-            rows, warning = _read_channel_rows(
-                channel,
-                since_id=since_id,
-                consumer_id=consumer_id,
-                limit=limit,
-                since_seq=since_seq,
-            )
-            if rows or warning:
-                return rows, warning
+            result = read()
             remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return [], None
+            if is_ready(result) or remaining <= 0:
+                return result
             try:
                 await asyncio.wait_for(
                     condition.wait(), timeout=min(remaining, 1.0)
@@ -1500,6 +1515,33 @@ async def list_tools() -> list[Tool]:
             "Only this consumer may claim the task; null or omitted means any worker"
         ),
     }
+    compact_read_input = {
+        "type": "boolean",
+        "default": False,
+        "description": (
+            "Return a structured message once (parsed message, no raw content string)"
+        ),
+    }
+    channels_input = {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": MAX_CHANNELS,
+        "description": (
+            "Read several channels in one call instead of channel; each entry "
+            "carries its own cursor. The result lists one block per channel."
+        ),
+        "items": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "minLength": 1},
+                "since_id": {"type": "string", "minLength": 1},
+                "since_seq": {"type": "integer", "minimum": 0},
+                "consumer_id": {"type": "string", "minLength": 1},
+            },
+            "required": ["channel"],
+            "additionalProperties": False,
+        },
+    }
     return [
         Tool(
             name="bridge_send",
@@ -1550,7 +1592,8 @@ async def list_tools() -> list[Tool]:
                 "prefix of 8+ hex chars) or since_seq (the seq of the last message "
                 "seen; see next_seq) for an explicit cursor, or consumer_id to resume "
                 "from that consumer's last acknowledged message. An unknown since_id "
-                "is an error, not an empty result."
+                "is an error, not an empty result. Pass channels instead of channel "
+                "to read several channels in one call."
             ),
             inputSchema={
                 "type": "object",
@@ -1560,16 +1603,10 @@ async def list_tools() -> list[Tool]:
                     "since_seq": {"type": "integer", "minimum": 0},
                     "consumer_id": {"type": "string", "minLength": 1},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
-                    "compact": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": (
-                            "Return a structured message once (parsed message, "
-                            "no raw content string)"
-                        ),
-                    },
+                    "compact": compact_read_input,
+                    "channels": channels_input,
                 },
-                "required": ["channel"],
+                "anyOf": [{"required": ["channel"]}, {"required": ["channels"]}],
                 "additionalProperties": False,
             },
             outputSchema=object_output,
@@ -1585,7 +1622,9 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Wait efficiently for new messages after since_id (id or unique id "
                 "prefix), since_seq or a durable consumer cursor. Use this instead of "
-                "repeated polling; timeout is capped at 55 seconds."
+                "repeated polling; timeout is capped at 55 seconds. Pass channels "
+                "instead of channel to wait on several channels; it returns when any "
+                "has news."
             ),
             inputSchema={
                 "type": "object",
@@ -1596,20 +1635,14 @@ async def list_tools() -> list[Tool]:
                     "consumer_id": {"type": "string", "minLength": 1},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
                     "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 55, "default": 20},
-                    "compact": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": (
-                            "Return a structured message once (parsed message, "
-                            "no raw content string)"
-                        ),
-                    },
+                    "compact": compact_read_input,
+                    "channels": channels_input,
                 },
-                "required": ["channel"],
                 "anyOf": [
-                    {"required": ["since_id"]},
-                    {"required": ["since_seq"]},
-                    {"required": ["consumer_id"]},
+                    {"required": ["channel", "since_id"]},
+                    {"required": ["channel", "since_seq"]},
+                    {"required": ["channel", "consumer_id"]},
+                    {"required": ["channels"]},
                 ],
                 "additionalProperties": False,
             },
@@ -2216,6 +2249,53 @@ def _channel_read_data(
     }
 
 
+def _read_limit(arguments: dict[str, Any]) -> int:
+    return normalize_limit(arguments.get("limit"), default=20, maximum=500)
+
+
+def _read_cursors(
+    cursors: list[ChannelCursor], limit: int
+) -> list[tuple[ChannelCursor, list[sqlite3.Row]]]:
+    """Read every channel after its cursor; a stale since_id fails the whole call."""
+    reads = []
+    for cursor in cursors:
+        rows, warning = _read_channel_rows(
+            cursor.channel,
+            since_id=cursor.since_id,
+            consumer_id=cursor.consumer_id,
+            limit=limit,
+            since_seq=cursor.since_seq,
+        )
+        if warning:
+            raise stale_cursor_error()
+        reads.append((cursor, rows))
+    return reads
+
+
+def _channels_output(
+    reads: list[tuple[ChannelCursor, list[sqlite3.Row]]],
+    arguments: dict[str, Any],
+    *,
+    structured: bool,
+    waited: bool = False,
+) -> list[TextContent] | tuple[list[TextContent], dict[str, Any]]:
+    compact = bool(arguments.get("compact"))
+    blocks = [
+        _channel_read_data(cursor.channel, rows, cursor.read_arguments(compact))
+        for cursor, rows in reads
+    ]
+    texts = [
+        _format_message_rows(cursor.channel, rows)
+        if rows
+        else f"[{cursor.channel}] — no new messages"
+        for cursor, rows in reads
+    ]
+    data: dict[str, Any] = {"channels": blocks}
+    if waited:
+        data["timed_out"] = not any(rows for _cursor, rows in reads)
+    return _tool_output("\n\n".join(texts), data, structured=structured)
+
+
 def _task_payload(arguments: dict[str, Any]) -> str:
     if "payload" in arguments:
         return canonical_json(arguments["payload"], field="payload")
@@ -2274,6 +2354,11 @@ async def dispatch_tool(
         )
 
     # ── bridge_receive ───────────────────────────────────────────────────────
+    elif name == "bridge_receive" and "channels" in arguments:
+        cursors = parse_channel_cursors(arguments, require_cursor=False)
+        reads = _read_cursors(cursors, _read_limit(arguments))
+        return _channels_output(reads, arguments, structured=structured)
+
     elif name == "bridge_receive":
         channel = validate_channel(arguments["channel"])
         since_id = arguments.get("since_id")
@@ -2297,6 +2382,15 @@ async def dispatch_tool(
         return _tool_output(
             _format_message_rows(channel, rows), data, structured=structured
         )
+
+    elif name == "bridge_wait" and "channels" in arguments:
+        cursors = parse_channel_cursors(arguments, require_cursor=True)
+        reads = await _wait_until_ready(
+            lambda: _read_cursors(cursors, _read_limit(arguments)),
+            lambda results: any(rows for _cursor, rows in results),
+            arguments.get("timeout_seconds", 20),
+        )
+        return _channels_output(reads, arguments, structured=structured, waited=True)
 
     elif name == "bridge_wait":
         channel = validate_channel(arguments["channel"])
