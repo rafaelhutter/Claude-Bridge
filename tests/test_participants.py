@@ -12,9 +12,13 @@ from claude_bridge.participants import parse_usage_report
 from claude_bridge.timestamps import utc_timestamp
 from claude_bridge.validation import BridgeValidationError
 
+# Resets relative to today: the server rejects a reset outside its plausible window.
+_TODAY = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+SESSION_RESET = _TODAY + timedelta(days=1, hours=1, minutes=20)
+WEEKLY_RESET = _TODAY + timedelta(days=4, hours=8)
 REPORT = {
-    "session": {"used_pct": 42, "resets_at": "2026-11-23T01:20:00Z"},
-    "weekly": {"used_pct": 71, "resets_at": "2026-11-27T08:00:00Z"},
+    "session": {"used_pct": 42, "resets_at": SESSION_RESET.strftime("%Y-%m-%dT%H:%M:%SZ")},
+    "weekly": {"used_pct": 71, "resets_at": WEEKLY_RESET.strftime("%Y-%m-%dT%H:%M:%SZ")},
 }
 
 
@@ -252,7 +256,7 @@ async def test_structured_output_has_presence_open_tasks_and_usage(fresh_db):
     assert w1["presence"] == "online" and w1["open_tasks"] == 1
     assert w1["usage"]["session"] == {
         "used_pct": 42.0,
-        "resets_at": "2026-11-23T01:20:00.000000Z",
+        "resets_at": utc_timestamp(SESSION_RESET),
     }
     assert w1["usage"]["weekly"]["used_pct"] == 71.0
     assert w1["usage"]["reported_at"] < w1["usage"]["stale_at"]
@@ -263,7 +267,8 @@ async def test_text_line_shows_presence_usage_windows_and_age(fresh_db):
     await call("bridge_enqueue", {"channel": "jobs", "content": "a", "enqueued_by": "w1"})
     report_usage("w1", REPORT, minutes_ago=3)
     assert (
-        "  w1 · online · 5h 42% (resets 01:20Z) · wk 71% (resets 2026-11-27) · "
+        "  w1 · online · 5h 42% (resets 01:20Z) · "
+        f"wk 71% (resets {WEEKLY_RESET:%Y-%m-%d}) · "
         "usage 3 min old · no task · 1 enqueued task(s) open"
     ) in (await participants_text()).splitlines()
 
