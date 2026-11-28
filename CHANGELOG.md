@@ -8,6 +8,25 @@ versioning where the Python packaging format allows.
 
 ### Added
 
+- **Worker-addressed tasks.** `bridge_enqueue` and `bridge_replace` take an
+  optional `assignee`; `bridge_claim` by another consumer skips the task, and the
+  skip uses no attempt. `bridge_assign` lets the enqueuer change or clear it.
+- **Release and lease renewal.** `bridge_release` gives a held task back
+  untouched and refunds the claim's attempt. `bridge_extend` moves the lease
+  expiry without a new claim and returns the unread notes. Only `bridge_fail`
+  and an expired lease use up attempts.
+- **Progress line.** `bridge_extend`, `bridge_release` and `bridge_task_note`
+  take an optional `progress` (one line, max 300 chars, empty clears), shown in
+  `bridge_tasks`; `last_error` stays for real failures.
+- **Lean task listing.** `bridge_tasks` takes `status` as one status or a list,
+  `exclude_terminal`, `assignee`, `worked_by`, and `compact=true` for rows
+  without `result`.
+- **Cursors.** `bridge_receive`/`bridge_wait` accept a unique id prefix (8+ hex
+  chars) as `since_id`, or `since_seq`; results carry `next_seq`.
+- **Compact reads.** `compact=true` on `bridge_receive`/`bridge_wait` returns a
+  structured message once (parsed `message`, no raw `content`).
+- **Multi-channel reads.** `channels: [{channel, since_id|since_seq|consumer_id}]`
+  reads or waits on up to 10 channels in one call.
 - **Task notes.** `bridge_task_note` attaches a note to a pending or claimed
   task, so an orchestrator can correct a task without a new one. The worker
   gets every note at `bridge_claim` (`task.notes`), new ones with
@@ -50,6 +69,12 @@ versioning where the Python packaging format allows.
   them in a Participants panel (compact on mobile).
 - Schema: new nullable `tasks.title` and five `participants.usage_*` columns.
   An older database upgrades in place; the task-queue schema version stays 1.
+
+### Changed
+
+- `bridge_receive`/`bridge_wait` with an unknown `since_id` now fail with a
+  `not_found` error instead of an empty list and a warning, which read as "no
+  new messages". The HTTP API (`/api/messages`, `/api/wait`) keeps the warning.
 
 ### Fixed
 
