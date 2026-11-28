@@ -1070,7 +1070,7 @@ async def _claim_task_once(
 
 
 def _record_task_resolution(task) -> None:
-    """After complete/fail: the worker was active and no longer holds the task."""
+    """After complete/fail/release: the worker was active and holds the task no more."""
     participants = participant_store()
     if task.worked_by is not None:  # A lease taken before worked_by existed.
         participants.touch(task.worked_by)
@@ -2074,6 +2074,20 @@ def _format_message_rows(channel: str, rows: list[sqlite3.Row]) -> str:
     return f"[{channel}] — {len(rows)} message(s)\n" + "\n".join(lines).rstrip()
 
 
+def _held_task_output(
+    outcome: TaskWithNotes, headline: str, *, structured: bool
+) -> list[TextContent] | tuple[list[TextContent], dict[str, Any]]:
+    """Result of a lease operation: the task plus the notes its worker has not read."""
+    return _tool_output(
+        headline + _notes_text("unread notes", outcome.notes),
+        {
+            **task_to_dict(outcome.task, include_payload=False),
+            "unread_notes": notes_to_dicts(outcome.notes),
+        },
+        structured=structured,
+    )
+
+
 def _task_payload(arguments: dict[str, Any]) -> str:
     if "payload" in arguments:
         return canonical_json(arguments["payload"], field="payload")
@@ -2450,15 +2464,10 @@ async def dispatch_tool(
                 delay_seconds=arguments.get("delay_seconds", 0),
                 progress=arguments.get("progress"),
             )
-        task, unread = outcome.task, outcome.notes
-        return _tool_output(
-            f"✓ Released task {task.id} on [{channel}] "
-            f"(pending, attempt {task.attempts}/{task.max_attempts})"
-            + _notes_text("unread notes", unread),
-            {
-                **task_to_dict(task, include_payload=False),
-                "unread_notes": notes_to_dicts(unread),
-            },
+        return _held_task_output(
+            outcome,
+            f"✓ Released task {outcome.task.id} on [{channel}] (pending, attempt "
+            f"{outcome.task.attempts}/{outcome.task.max_attempts})",
             structured=structured,
         )
 
@@ -2473,15 +2482,10 @@ async def dispatch_tool(
                 lease_seconds=_clamp_lease_seconds(arguments.get("lease_seconds")),
                 progress=arguments.get("progress"),
             )
-        task, unread = outcome.task, outcome.notes
-        return _tool_output(
-            f"✓ Extended lease on task {task.id} on [{channel}] "
-            f"until {task.lease_expires_at}"
-            + _notes_text("unread notes", unread),
-            {
-                **task_to_dict(task, include_payload=False),
-                "unread_notes": notes_to_dicts(unread),
-            },
+        return _held_task_output(
+            outcome,
+            f"✓ Extended lease on task {outcome.task.id} on [{channel}] "
+            f"until {outcome.task.lease_expires_at}",
             structured=structured,
         )
 
