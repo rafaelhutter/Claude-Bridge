@@ -53,7 +53,7 @@ async def test_progress_shows_in_the_task_listing(fresh_db):
 
 
 @pytest.mark.asyncio
-async def test_release_sets_progress_for_the_next_worker(fresh_db):
+async def test_release_leaves_progress_on_the_pending_task(fresh_db):
     task = await enqueue_and_claim()
     released = await data(
         "bridge_release", {**lease_args(task), "progress": "waiting for gate"}
@@ -110,3 +110,25 @@ async def test_legacy_database_gains_the_progress_column(tmp_path, monkeypatch):
     finally:
         bridge._conn.close()
         monkeypatch.setattr(bridge, "_conn", None)
+
+
+@pytest.mark.asyncio
+async def test_a_new_claim_starts_without_the_old_progress(fresh_db):
+    task = await enqueue_and_claim()
+    await data("bridge_release", {**lease_args(task), "progress": "gave it back"})
+    again = await data("bridge_claim", {"channel": "jobs", "consumer": "w2"})
+    assert again["task"]["progress"] is None
+
+
+@pytest.mark.asyncio
+async def test_replace_clears_the_progress(fresh_db):
+    enq = await data(
+        "bridge_enqueue", {"channel": "jobs", "content": "v1", "enqueued_by": "lead"}
+    )
+    claimed = await data("bridge_claim", {"channel": "jobs", "consumer": "w1"})
+    await data("bridge_release", {**lease_args(claimed["task"]), "progress": "blocked"})
+    replaced = await data(
+        "bridge_replace",
+        {"channel": "jobs", "task_id": enq["task_id"], "sender": "lead", "content": "v2"},
+    )
+    assert replaced["progress"] is None

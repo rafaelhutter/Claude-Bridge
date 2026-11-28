@@ -1452,6 +1452,14 @@ async def list_tools() -> list[Tool]:
         "maxLength": 120,
         "description": "Short task title; derived from the payload when omitted",
     }
+    progress_input = {
+        "type": "string",
+        "maxLength": 300,
+        "description": (
+            "One-line task status shown in bridge_tasks (not an error); a new "
+            "claim clears it, and so does an empty string"
+        ),
+    }
     return [
         Tool(
             name="bridge_send",
@@ -1812,14 +1820,7 @@ async def list_tools() -> list[Tool]:
                         "maximum": 1000000000,
                         "default": 0,
                     },
-                    "progress": {
-                        "type": "string",
-                        "maxLength": 300,
-                        "description": (
-                            "One-line task status shown in bridge_tasks (not an "
-                            "error); empty string clears it"
-                        ),
-                    },
+                    "progress": progress_input,
                 },
                 "required": ["channel", "task_id", "lease_token"],
                 "additionalProperties": False,
@@ -1848,14 +1849,7 @@ async def list_tools() -> list[Tool]:
                     "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
                     "lease_token": {"type": "string", "minLength": 1, "maxLength": 256},
                     "lease_seconds": {"type": "integer", "minimum": 1},
-                    "progress": {
-                        "type": "string",
-                        "maxLength": 300,
-                        "description": (
-                            "One-line task status shown in bridge_tasks (not an "
-                            "error); empty string clears it"
-                        ),
-                    },
+                    "progress": progress_input,
                 },
                 "required": ["channel", "task_id", "lease_token"],
                 "additionalProperties": False,
@@ -1970,14 +1964,7 @@ async def list_tools() -> list[Tool]:
                     "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
                     "sender": {"type": "string", "minLength": 1, "maxLength": 128},
                     "content": {"type": "string", "minLength": 1},
-                    "progress": {
-                        "type": "string",
-                        "maxLength": 300,
-                        "description": (
-                            "One-line task status shown in bridge_tasks (not an "
-                            "error); empty string clears it"
-                        ),
-                    },
+                    "progress": progress_input,
                 },
                 "required": ["channel", "task_id", "sender", "content"],
                 "additionalProperties": False,
