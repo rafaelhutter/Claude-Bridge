@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .taskqueue import Task, TaskStatus, task_to_dict
+from .taskqueue import Task, TaskStatus, task_to_dict, validate_statuses
 from .validation import BridgeValidationError
 
 OPEN_STATUSES = (TaskStatus.PENDING.value, TaskStatus.CLAIMED.value)
@@ -37,6 +37,8 @@ def requested_statuses(arguments: dict[str, Any]) -> list[str] | None:
         raise BridgeValidationError(
             "status", "invalid_type", "must be a status or a list of statuses"
         )
+    if statuses is not None:
+        statuses = validate_statuses(statuses)
     if not arguments.get("exclude_terminal"):
         return statuses
     return [s for s in (statuses or OPEN_STATUSES) if s in OPEN_STATUSES]

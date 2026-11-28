@@ -899,30 +899,28 @@ class TaskStore:
         self,
         *,
         channel: str,
-        status: str | None = None,
         limit: int = 50,
         statuses: list[str] | None = None,
         assignee: str | None = None,
         worked_by: str | None = None,
     ) -> list[Task]:
-        """Newest tasks first; every given filter must match."""
+        """Newest tasks first; every given filter must match (``[]`` matches none)."""
         channel = validate_channel(channel)
         limit = normalize_limit(limit, default=50, maximum=500)
-        wanted = [status] if status is not None else statuses
         query = _TASK_SELECT + "WHERE channel = ?"
         params: list = [channel]
-        if wanted is not None:
-            wanted = _validate_statuses(wanted)
-            if not wanted:
-                return []
-            query += f" AND status IN ({', '.join('?' * len(wanted))})"
-            params.extend(wanted)
         if assignee is not None:
             query += " AND assignee = ?"
             params.append(validate_assignee(assignee))
         if worked_by is not None:
             query += " AND worked_by = ?"
             params.append(validate_consumer(worked_by))
+        if statuses is not None:
+            statuses = validate_statuses(statuses)
+            if not statuses:
+                return []
+            query += f" AND status IN ({', '.join('?' * len(statuses))})"
+            params.extend(statuses)
         query += " ORDER BY seq DESC LIMIT ?"
         params.append(limit)
         with self._lock:
@@ -991,7 +989,7 @@ class TaskStore:
             ).rowcount
 
 
-def _validate_statuses(statuses: list[str]) -> list[str]:
+def validate_statuses(statuses: list[str]) -> list[str]:
     known = [s.value for s in TaskStatus]
     for status in statuses:
         if status not in known:
@@ -1070,4 +1068,5 @@ __all__ = [
     "note_to_dict",
     "notes_to_dicts",
     "task_to_dict",
+    "validate_statuses",
 ]
