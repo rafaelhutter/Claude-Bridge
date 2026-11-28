@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 
 import claude_bridge.server as bridge
+from claude_bridge.validation import BridgeValidationError
 
 
 def text(result):
@@ -71,25 +72,16 @@ async def test_receive_since_id_returns_only_newer(fresh_db):
 
 
 @pytest.mark.asyncio
-async def test_receive_unknown_since_id_returns_stale_cursor(fresh_db):
-    """Unknown since_id must NOT silently dump the channel from the start.
-
-    Pre-v0.7.4 behaviour was a silent fallback to `since_seq = 0`, which
-    flooded the caller with the full channel on every poll once the cursor
-    went bad (e.g. after `bridge_clear`).
-    """
+async def test_receive_unknown_since_id_is_an_error(fresh_db):
+    """Unknown since_id must NOT silently dump the channel from the start,
+    nor look like "no new messages": it is a stale-cursor error."""
     await bridge.dispatch_tool("bridge_send", {"channel": "c", "sender": "a", "content": "one"})
     await bridge.dispatch_tool("bridge_send", {"channel": "c", "sender": "a", "content": "two"})
 
     bogus = "00000000-0000-0000-0000-000000000000"
-    out = text(await bridge.dispatch_tool("bridge_receive", {
-        "channel": "c", "since_id": bogus,
-    }))
-    assert "not found" in out
-    assert "cursor stale" in out
-    # And critically, neither of the existing messages leaked into the response.
-    assert "one" not in out
-    assert "two" not in out
+    with pytest.raises(BridgeValidationError) as err:
+        await bridge.dispatch_tool("bridge_receive", {"channel": "c", "since_id": bogus})
+    assert (err.value.field, err.value.code) == ("since_id", "not_found")
 
 
 @pytest.mark.asyncio
