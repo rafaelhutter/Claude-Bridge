@@ -113,3 +113,10 @@ async def test_wait_needs_a_cursor_per_channel(fresh_db):
     with pytest.raises(BridgeValidationError) as err:
         await data("bridge_wait", {"channels": [{"channel": "a"}], "timeout_seconds": 0})
     assert err.value.code == "cursor_required"
+
+
+@pytest.mark.asyncio
+async def test_a_wrongly_typed_entry_cursor_is_named(fresh_db):
+    with pytest.raises(BridgeValidationError) as err:
+        await data("bridge_receive", {"channels": [{"channel": "a", "since_seq": "3"}]})
+    assert err.value.field == "since_seq"
