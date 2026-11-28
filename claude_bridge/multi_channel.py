@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
-from .validation import BridgeValidationError, validate_channel
+from .message_cursors import validate_since_seq
+from .validation import (
+    BridgeValidationError,
+    validate_channel,
+    validate_consumer,
+    validate_reference,
+)
 
 MAX_CHANNELS = 10
 _CURSOR_KEYS = ("since_id", "since_seq", "consumer_id")
@@ -68,10 +74,14 @@ def _parse_entry(entry: Any) -> ChannelCursor:
         )
     return ChannelCursor(
         channel=validate_channel(entry["channel"]),
-        since_id=entry.get("since_id"),
-        since_seq=entry.get("since_seq"),
-        consumer_id=entry.get("consumer_id"),
+        since_id=_optional(entry, "since_id", lambda v: validate_reference(v, "since_id")),
+        since_seq=_optional(entry, "since_seq", validate_since_seq),
+        consumer_id=_optional(entry, "consumer_id", validate_consumer),
     )
+
+
+def _optional(entry: dict[str, Any], key: str, validate: Callable[[Any], Any]) -> Any:
+    return validate(entry[key]) if entry.get(key) is not None else None
 
 
 __all__ = ["MAX_CHANNELS", "ChannelCursor", "parse_channel_cursors"]
