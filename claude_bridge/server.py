@@ -459,8 +459,14 @@ def _is_json_str(s: str) -> bool:
         return False
 
 
-def _message_record(row: sqlite3.Row, channel: str) -> dict[str, Any]:
-    """Convert a stored row into a stable, machine-readable representation."""
+def _message_record(
+    row: sqlite3.Row, channel: str, *, compact: bool = False
+) -> dict[str, Any]:
+    """Convert a stored row into a stable, machine-readable representation.
+
+    ``compact`` leaves out the raw ``content`` of a structured message, whose
+    parsed ``message`` carries the same data.
+    """
     parsed = parse_message_content(row["content"])
     result: dict[str, Any] = {
         "seq": int(row["seq"]),
@@ -473,6 +479,8 @@ def _message_record(row: sqlite3.Row, channel: str) -> dict[str, Any]:
     }
     if parsed.envelope is not None:
         result["message"] = parsed.envelope.to_dict()
+        if compact:
+            del result["content"]
     elif parsed.error:
         result["parse_warning"] = parsed.error
     return result
@@ -1449,6 +1457,14 @@ async def list_tools() -> list[Tool]:
                     "since_id": {"type": "string", "minLength": 1},
                     "consumer_id": {"type": "string", "minLength": 1},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
+                    "compact": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Return a structured message once (parsed message, "
+                            "no raw content string)"
+                        ),
+                    },
                 },
                 "required": ["channel"],
                 "additionalProperties": False,
@@ -1475,6 +1491,14 @@ async def list_tools() -> list[Tool]:
                     "consumer_id": {"type": "string", "minLength": 1},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
                     "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 55, "default": 20},
+                    "compact": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Return a structured message once (parsed message, "
+                            "no raw content string)"
+                        ),
+                    },
                 },
                 "required": ["channel"],
                 "anyOf": [{"required": ["since_id"]}, {"required": ["consumer_id"]}],
@@ -1998,7 +2022,8 @@ async def dispatch_tool(
             consumer_id=consumer_id,
             limit=limit,
         )
-        records = [_message_record(row, channel) for row in rows]
+        compact = bool(arguments.get("compact"))
+        records = [_message_record(row, channel, compact=compact) for row in rows]
         next_cursor = rows[-1]["id"] if rows else since_id
         data = {
             "channel": channel,
@@ -2034,7 +2059,8 @@ async def dispatch_tool(
             limit=limit,
             timeout_seconds=arguments.get("timeout_seconds", 20),
         )
-        records = [_message_record(row, channel) for row in rows]
+        compact = bool(arguments.get("compact"))
+        records = [_message_record(row, channel, compact=compact) for row in rows]
         data = {
             "channel": channel,
             "messages": records,
