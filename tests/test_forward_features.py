@@ -14,6 +14,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import claude_bridge.server as bridge
+from claude_bridge.validation import BridgeValidationError
 
 
 def text(result):
@@ -413,13 +414,13 @@ async def test_cursor_from_another_channel_is_rejected(fresh_db):
     await bridge.dispatch_tool(
         "bridge_send", {"channel": "b", "sender": "y", "content": "must-not-skip"}
     )
-    _content, result = await bridge.dispatch_tool(
-        "bridge_receive",
-        {"channel": "b", "since_id": message_id(foreign)},
-        structured=True,
-    )
-    assert result["messages"] == []
-    assert result["warning"] == "since_id_not_found"
+    with pytest.raises(BridgeValidationError) as err:
+        await bridge.dispatch_tool(
+            "bridge_receive",
+            {"channel": "b", "since_id": message_id(foreign)},
+            structured=True,
+        )
+    assert err.value.code == "not_found"
 
 
 def test_deep_legacy_json_cannot_poison_reads(fresh_db):

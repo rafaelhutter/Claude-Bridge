@@ -63,7 +63,6 @@ from .reliability import (
     ReliabilityStore,
     ReservationStatus,
     ensure_reliability_schema,
-    resolve_channel_message_seq,
 )
 from .sessions import SessionStore
 from .security_headers import SecurityHeadersMiddleware
@@ -78,6 +77,11 @@ from .participants import (
     ensure_participants_schema,
     overview_to_dict,
     parse_usage_report,
+)
+from .message_cursors import (
+    resolve_message_cursor,
+    stale_cursor_error,
+    validate_since_seq,
 )
 from .taskqueue import (
     MAX_NOTE_BYTES,
@@ -484,14 +488,20 @@ def _read_channel_rows(
     since_id: str | None = None,
     consumer_id: str | None = None,
     limit: int = 20,
+    since_seq: int | None = None,
 ) -> tuple[list[sqlite3.Row], str | None]:
-    """Read a channel using an explicit or durable consumer cursor."""
+    """Read a channel using an explicit (id or seq) or durable consumer cursor."""
     channel = validate_channel(channel)
     limit = normalize_limit(limit, default=20, maximum=500)
     conn = db()
-    since_seq: int | None = None
-    if since_id:
-        since_seq = resolve_channel_message_seq(conn, channel, since_id)
+    if since_seq is not None:
+        if since_id:
+            raise BridgeValidationError(
+                "since_seq", "conflict", "give since_id or since_seq, not both"
+            )
+        since_seq = validate_since_seq(since_seq)
+    elif since_id:
+        since_seq = resolve_message_cursor(conn, channel, since_id)
         if since_seq is None:
             return [], "since_id_not_found"
     elif consumer_id:
@@ -527,13 +537,14 @@ async def _wait_channel_rows(
     consumer_id: str | None,
     limit: int,
     timeout_seconds: float,
+    since_seq: int | None = None,
 ) -> tuple[list[sqlite3.Row], str | None]:
     """Wait without busy-polling; periodic rechecks catch cross-process writes."""
-    if not since_id and not consumer_id:
+    if not since_id and not consumer_id and since_seq is None:
         raise BridgeValidationError(
             "cursor",
             "required",
-            "bridge_wait requires since_id or consumer_id",
+            "bridge_wait requires since_id, since_seq or consumer_id",
         )
     timeout_seconds = max(0.0, min(float(timeout_seconds), 55.0))
     deadline = asyncio.get_running_loop().time() + timeout_seconds
@@ -545,6 +556,7 @@ async def _wait_channel_rows(
                 since_id=since_id,
                 consumer_id=consumer_id,
                 limit=limit,
+                since_seq=since_seq,
             )
             if rows or warning:
                 return rows, warning
@@ -1439,14 +1451,18 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="bridge_receive",
             description=(
-                "Read durable messages. Pass since_id for an explicit cursor or consumer_id "
-                "to resume from that consumer's last acknowledged message."
+                "Read durable messages. Pass since_id (a message id or a unique id "
+                "prefix of 8+ hex chars) or since_seq (the seq of the last message "
+                "seen; see next_seq) for an explicit cursor, or consumer_id to resume "
+                "from that consumer's last acknowledged message. An unknown since_id "
+                "is an error, not an empty result."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "channel": {"type": "string", "minLength": 1},
                     "since_id": {"type": "string", "minLength": 1},
+                    "since_seq": {"type": "integer", "minimum": 0},
                     "consumer_id": {"type": "string", "minLength": 1},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
                 },
@@ -1464,20 +1480,26 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="bridge_wait",
             description=(
-                "Wait efficiently for new messages after since_id or a durable consumer cursor. "
-                "Use this instead of repeated polling; timeout is capped at 55 seconds."
+                "Wait efficiently for new messages after since_id (id or unique id "
+                "prefix), since_seq or a durable consumer cursor. Use this instead of "
+                "repeated polling; timeout is capped at 55 seconds."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "channel": {"type": "string", "minLength": 1},
                     "since_id": {"type": "string", "minLength": 1},
+                    "since_seq": {"type": "integer", "minimum": 0},
                     "consumer_id": {"type": "string", "minLength": 1},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
                     "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 55, "default": 20},
                 },
                 "required": ["channel"],
-                "anyOf": [{"required": ["since_id"]}, {"required": ["consumer_id"]}],
+                "anyOf": [
+                    {"required": ["since_id"]},
+                    {"required": ["since_seq"]},
+                    {"required": ["consumer_id"]},
+                ],
                 "additionalProperties": False,
             },
             outputSchema=object_output,
@@ -1929,6 +1951,22 @@ def _format_message_rows(channel: str, rows: list[sqlite3.Row]) -> str:
     return f"[{channel}] — {len(rows)} message(s)\n" + "\n".join(lines).rstrip()
 
 
+def _channel_read_data(
+    channel: str, rows: list[sqlite3.Row], arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Structured result of one channel read; the cursors resume after its last row."""
+    since_id = arguments.get("since_id")
+    since_seq = arguments.get("since_seq")
+    return {
+        "channel": channel,
+        "messages": [_message_record(row, channel) for row in rows],
+        "next_cursor": rows[-1]["id"] if rows else since_id,
+        "next_seq": int(rows[-1]["seq"]) if rows else since_seq,
+        "consumer_id": arguments.get("consumer_id"),
+        "warning": None,
+    }
+
+
 def _task_payload(arguments: dict[str, Any]) -> str:
     if "payload" in arguments:
         return canonical_json(arguments["payload"], field="payload")
@@ -1997,22 +2035,11 @@ async def dispatch_tool(
             since_id=since_id,
             consumer_id=consumer_id,
             limit=limit,
+            since_seq=arguments.get("since_seq"),
         )
-        records = [_message_record(row, channel) for row in rows]
-        next_cursor = rows[-1]["id"] if rows else since_id
-        data = {
-            "channel": channel,
-            "messages": records,
-            "next_cursor": next_cursor,
-            "consumer_id": consumer_id,
-            "warning": warning,
-        }
         if warning:
-            text = (
-                f"[{channel}] — since_id {str(since_id)[:8]} not found "
-                "in this channel (cursor stale); re-sync without since_id"
-            )
-            return _tool_output(text, data, structured=structured)
+            raise stale_cursor_error()
+        data = _channel_read_data(channel, rows, arguments)
         if not rows:
             suffix = f" after {since_id[:8]}" if since_id else ""
             return _tool_output(
@@ -2024,28 +2051,19 @@ async def dispatch_tool(
 
     elif name == "bridge_wait":
         channel = validate_channel(arguments["channel"])
-        since_id = arguments.get("since_id")
-        consumer_id = arguments.get("consumer_id")
         limit = normalize_limit(arguments.get("limit"), default=20, maximum=500)
         rows, warning = await _wait_channel_rows(
             channel,
-            since_id=since_id,
-            consumer_id=consumer_id,
+            since_id=arguments.get("since_id"),
+            consumer_id=arguments.get("consumer_id"),
             limit=limit,
             timeout_seconds=arguments.get("timeout_seconds", 20),
+            since_seq=arguments.get("since_seq"),
         )
-        records = [_message_record(row, channel) for row in rows]
-        data = {
-            "channel": channel,
-            "messages": records,
-            "next_cursor": rows[-1]["id"] if rows else since_id,
-            "consumer_id": consumer_id,
-            "warning": warning,
-            "timed_out": not rows and warning is None,
-        }
         if warning:
-            text = f"[{channel}] — cursor not found in this channel"
-        elif rows:
+            raise stale_cursor_error()
+        data = {**_channel_read_data(channel, rows, arguments), "timed_out": not rows}
+        if rows:
             text = _format_message_rows(channel, rows)
         else:
             text = f"[{channel}] — no new messages before timeout"
