@@ -91,3 +91,17 @@ async def test_unknown_status_in_a_list_is_rejected(fresh_db):
     with pytest.raises(BridgeValidationError) as err:
         await listing(status=["pending", "nope"])
     assert err.value.field == "status"
+
+
+@pytest.mark.asyncio
+async def test_unknown_status_is_rejected_even_with_exclude_terminal(fresh_db):
+    with pytest.raises(BridgeValidationError) as err:
+        await listing(status="bogus", exclude_terminal=True)
+    assert err.value.field == "status"
+
+
+@pytest.mark.asyncio
+async def test_bad_assignee_filter_is_rejected_before_an_empty_status_match(fresh_db):
+    with pytest.raises(BridgeValidationError) as err:
+        await listing(status=["completed"], exclude_terminal=True, assignee=" w")
+    assert err.value.field == "assignee"
