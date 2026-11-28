@@ -891,20 +891,33 @@ class TaskStore:
         return counts
 
     def list_tasks(
-        self, *, channel: str, status: str | None = None, limit: int = 50
+        self,
+        *,
+        channel: str,
+        status: str | None = None,
+        limit: int = 50,
+        statuses: list[str] | None = None,
+        assignee: str | None = None,
+        worked_by: str | None = None,
     ) -> list[Task]:
+        """Newest tasks first; every given filter must match."""
         channel = validate_channel(channel)
         limit = normalize_limit(limit, default=50, maximum=500)
+        wanted = [status] if status is not None else statuses
         query = _TASK_SELECT + "WHERE channel = ?"
         params: list = [channel]
-        if status is not None:
-            if status not in {s.value for s in TaskStatus}:
-                raise BridgeValidationError(
-                    "status", "invalid", "must be one of "
-                    + ", ".join(s.value for s in TaskStatus)
-                )
-            query += " AND status = ?"
-            params.append(status)
+        if wanted is not None:
+            wanted = _validate_statuses(wanted)
+            if not wanted:
+                return []
+            query += f" AND status IN ({', '.join('?' * len(wanted))})"
+            params.extend(wanted)
+        if assignee is not None:
+            query += " AND assignee = ?"
+            params.append(validate_assignee(assignee))
+        if worked_by is not None:
+            query += " AND worked_by = ?"
+            params.append(validate_consumer(worked_by))
         query += " ORDER BY seq DESC LIMIT ?"
         params.append(limit)
         with self._lock:
@@ -971,6 +984,16 @@ class TaskStore:
             return self.conn.execute(
                 "DELETE FROM tasks WHERE channel = ?", (channel,)
             ).rowcount
+
+
+def _validate_statuses(statuses: list[str]) -> list[str]:
+    known = [s.value for s in TaskStatus]
+    for status in statuses:
+        if status not in known:
+            raise BridgeValidationError(
+                "status", "invalid", "must be one of " + ", ".join(known)
+            )
+    return list(dict.fromkeys(statuses))
 
 
 def task_to_dict(task: Task, *, include_payload: bool = True) -> dict:
