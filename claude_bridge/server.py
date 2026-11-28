@@ -80,6 +80,7 @@ from .participants import (
     parse_usage_report,
 )
 from .taskqueue import (
+    KEEP_ASSIGNEE,
     MAX_NOTE_BYTES,
     MAX_NOTE_BYTES_PER_TASK,
     MAX_NOTES_PER_TASK,
@@ -1026,6 +1027,7 @@ async def enqueue_task_reliable(
     idempotency_key: str | None = None,
     enqueued_by: str | None = None,
     title: str | None = None,
+    assignee: str | None = None,
 ):
     result = await _write_transaction(
         lambda: task_store().enqueue(
@@ -1039,6 +1041,7 @@ async def enqueue_task_reliable(
             idempotency_key=idempotency_key,
             enqueued_by=enqueued_by,
             title=title,
+            assignee=assignee,
         )
     )
     if result.created:
@@ -1206,6 +1209,7 @@ async def replace_task_reliable(
     priority: int | None = None,
     delay_seconds: int | None = None,
     title: str | None = None,
+    assignee=KEEP_ASSIGNEE,
 ):
     task = await _write_transaction(
         lambda: task_store().replace(
@@ -1216,9 +1220,23 @@ async def replace_task_reliable(
             priority=priority,
             delay_seconds=delay_seconds,
             title=title,
+            assignee=assignee,
         )
     )
     # A new priority or delay can make the task claimable now; wake waiters.
+    await _notify_task_waiters()
+    return task
+
+
+async def assign_task_reliable(
+    *, channel: str, task_id: str, sender: str, assignee: str | None
+):
+    task = await _write_transaction(
+        lambda: task_store().assign(
+            channel=channel, task_id=task_id, sender=sender, assignee=assignee
+        )
+    )
+    # A cleared or changed assignee can make the task claimable for a waiter.
     await _notify_task_waiters()
     return task
 
@@ -1392,6 +1410,14 @@ async def list_tools() -> list[Tool]:
         "minLength": 1,
         "maxLength": 120,
         "description": "Short task title; derived from the payload when omitted",
+    }
+    assignee_input = {
+        "type": ["string", "null"],
+        "minLength": 1,
+        "maxLength": 128,
+        "description": (
+            "Only this consumer may claim the task; null or omitted means any worker"
+        ),
     }
     return [
         Tool(
@@ -1620,6 +1646,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "enqueued_by": {"type": "string", "minLength": 1, "maxLength": 256},
                     "title": title_input,
+                    "assignee": assignee_input,
                 },
                 "required": ["channel"],
                 "oneOf": [
@@ -1761,6 +1788,10 @@ async def list_tools() -> list[Tool]:
                         "description": "New delay from now; omit to keep the current one",
                     },
                     "title": title_input,
+                    "assignee": {
+                        **assignee_input,
+                        "description": "New assignee; null clears it, omit to keep it",
+                    },
                 },
                 "required": ["channel", "task_id", "sender"],
                 "oneOf": [
@@ -1774,6 +1805,34 @@ async def list_tools() -> list[Tool]:
                 title="Replace task",
                 readOnlyHint=False,
                 destructiveHint=True,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        ),
+        Tool(
+            name="bridge_assign",
+            description=(
+                "Address a pending or claimed task to one worker (assignee) or to any "
+                "worker (assignee null). bridge_claim by another consumer skips it. "
+                "Only the original enqueuer (sender must equal enqueued_by) may assign. "
+                "A claimed task keeps its lease; the assignee applies from the next claim."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "sender": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "assignee": assignee_input,
+                },
+                "required": ["channel", "task_id", "sender", "assignee"],
+                "additionalProperties": False,
+            },
+            outputSchema=object_output,
+            annotations=ToolAnnotations(
+                title="Assign task",
+                readOnlyHint=False,
+                destructiveHint=False,
                 idempotentHint=True,
                 openWorldHint=False,
             ),
@@ -2198,6 +2257,7 @@ async def dispatch_tool(
             idempotency_key=arguments.get("idempotency_key"),
             enqueued_by=arguments.get("enqueued_by"),
             title=arguments.get("title"),
+            assignee=arguments.get("assignee"),
         )
         task = outcome.task
         verb = "Enqueued" if outcome.created else "Deduplicated (existing)"
@@ -2306,9 +2366,26 @@ async def dispatch_tool(
                 priority=arguments.get("priority"),
                 delay_seconds=arguments.get("delay_seconds"),
                 title=arguments.get("title"),
+                assignee=arguments.get("assignee", KEEP_ASSIGNEE),
             )
         return _tool_output(
             f"✓ Replaced task {task.id} on [{channel}] (status {task.status.value})",
+            task_to_dict(task, include_payload=False),
+            structured=structured,
+        )
+
+    # ── bridge_assign ────────────────────────────────────────────────────────
+    elif name == "bridge_assign":
+        channel = validate_channel(arguments["channel"])
+        with _task_errors_as_validation():
+            task = await assign_task_reliable(
+                channel=channel,
+                task_id=arguments["task_id"],
+                sender=arguments["sender"],
+                assignee=arguments["assignee"],
+            )
+        return _tool_output(
+            f"✓ Assigned task {task.id} on [{channel}] to {task.assignee or 'any worker'}",
             task_to_dict(task, include_payload=False),
             structured=structured,
         )
@@ -2330,6 +2407,7 @@ async def dispatch_tool(
         for t in tasks:
             lines.append(
                 f"  {t.id} · {t.status.value} · attempt {t.attempts}/{t.max_attempts}"
+                + (f" · for {t.assignee}" if t.assignee else "")
                 + (f" · {t.title}" if t.title else "")
             )
         return _tool_output(

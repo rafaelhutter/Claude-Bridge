@@ -38,6 +38,7 @@ from .validation import (
     DEFAULT_LIMITS,
     BridgeValidationError,
     normalize_limit,
+    validate_assignee,
     validate_channel,
     validate_consumer,
     validate_non_negative_int,
@@ -94,10 +95,11 @@ class TaskAction(str, Enum):
     """A task change that a caller can be refused."""
 
     REPLACE = "replace"
+    ASSIGN = "assign"
 
     @property
     def past_participle(self) -> str:
-        return {TaskAction.REPLACE: "replaced"}[self]
+        return {TaskAction.REPLACE: "replaced", TaskAction.ASSIGN: "assigned"}[self]
 
 
 class TaskPermissionError(TaskQueueError):
@@ -195,7 +197,15 @@ _TASK_ADDED_COLUMNS = {
     "worked_by": "TEXT",
     "notes_read_seq": "INTEGER NOT NULL DEFAULT 0",
     "title": "TEXT",
+    "assignee": "TEXT",
 }
+
+
+class _KeepAssignee:
+    """Marks an omitted assignee: the task keeps its current one."""
+
+
+KEEP_ASSIGNEE = _KeepAssignee()
 
 
 @contextmanager
@@ -258,6 +268,7 @@ def ensure_taskqueue_schema(conn: sqlite3.Connection) -> None:
                 worked_by        TEXT,
                 notes_read_seq   INTEGER NOT NULL DEFAULT 0,
                 title            TEXT,
+                assignee         TEXT,
                 created_at       TEXT    NOT NULL,
                 updated_at       TEXT    NOT NULL,
                 CHECK (
@@ -344,6 +355,7 @@ class Task:
     title: str | None
     created_at: str
     updated_at: str
+    assignee: str | None  # Only this consumer may claim; None means any worker.
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,6 +498,7 @@ class TaskStore:
         idempotency_key: str | None = None,
         enqueued_by: str | None = None,
         title: str | None = None,
+        assignee: str | None = None,
         now: datetime | None = None,
     ) -> EnqueueResult:
         channel = validate_channel(channel)
@@ -506,6 +519,7 @@ class TaskStore:
             idempotency_key = validate_reference(idempotency_key, "idempotency_key")
         if enqueued_by is not None:
             enqueued_by = validate_reference(enqueued_by, "enqueued_by")
+        assignee = validate_assignee(assignee)
 
         instant = as_utc(now or _utc_now())
         created_at = utc_timestamp(instant)
@@ -523,8 +537,8 @@ class TaskStore:
             self.conn.execute(
                 "INSERT INTO tasks (id, channel, payload, status, priority, attempts, "
                 "max_attempts, available_at, idempotency_key, enqueued_by, title, "
-                "created_at, updated_at) "
-                "VALUES (?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?, ?, ?, ?)",
+                "assignee, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
                     channel,
@@ -535,6 +549,7 @@ class TaskStore:
                     idempotency_key,
                     enqueued_by,
                     title,
+                    assignee,
                     created_at,
                     created_at,
                 ),
@@ -572,8 +587,9 @@ class TaskStore:
             self._resolve_expired_leases(channel, now_iso)
             row = self.conn.execute(
                 "SELECT seq FROM tasks WHERE channel = ? AND status = 'pending' "
-                "AND available_at <= ? ORDER BY priority DESC, seq ASC LIMIT 1",
-                (channel, now_iso),
+                "AND available_at <= ? AND (assignee IS NULL OR assignee = ?) "
+                "ORDER BY priority DESC, seq ASC LIMIT 1",
+                (channel, now_iso, consumer),
             ).fetchone()
             if row is None:
                 return None
@@ -765,6 +781,7 @@ class TaskStore:
         priority: int | None = None,
         delay_seconds: int | None = None,
         title: str | None = None,
+        assignee: str | None | _KeepAssignee = KEEP_ASSIGNEE,
         now: datetime | None = None,
     ) -> Task:
         """Swap a pending task's payload in place; id and queue position stay.
@@ -778,6 +795,8 @@ class TaskStore:
         title = _resolve_title(title, payload)
         if priority is not None:
             priority = validate_non_negative_int(priority, "priority", maximum=_MAX_COUNT)
+        keep_assignee = assignee is KEEP_ASSIGNEE
+        new_assignee = None if keep_assignee else validate_assignee(assignee)
         instant = as_utc(now or _utc_now())
         available_at = None
         if delay_seconds is not None:
@@ -793,12 +812,15 @@ class TaskStore:
                 "UPDATE tasks SET payload = ?, title = ?, "
                 "priority = COALESCE(?, priority), "
                 "available_at = COALESCE(?, available_at), attempts = 0, "
+                "assignee = CASE WHEN ? THEN assignee ELSE ? END, "
                 "last_error = NULL, updated_at = ? WHERE seq = ?",
                 (
                     payload,
                     title,
                     priority,
                     available_at,
+                    keep_assignee,
+                    new_assignee,
                     utc_timestamp(instant),
                     current.seq,
                 ),
@@ -817,6 +839,38 @@ class TaskStore:
         if current.status is not TaskStatus.PENDING:
             raise TaskStateError(channel, task_id, current.status, TaskAction.REPLACE)
         return current
+
+    def assign(
+        self,
+        *,
+        channel: str,
+        task_id: str,
+        sender: str,
+        assignee: str | None,
+        now: datetime | None = None,
+    ) -> Task:
+        """Address an open task to one worker (None: any worker).
+
+        Only the original enqueuer may assign. A claimed task keeps its lease;
+        the assignee applies from the next claim on.
+        """
+        channel = validate_channel(channel)
+        task_id = validate_reference(task_id, "task_id")
+        sender = validate_reference(sender, "sender")
+        assignee = validate_assignee(assignee)
+        with self.write_scope():
+            current = self._get(channel, task_id)
+            if current is None:
+                raise TaskNotFoundError(channel, task_id)
+            if current.enqueued_by != sender:
+                raise TaskPermissionError(channel, task_id, TaskAction.ASSIGN)
+            if current.status not in (TaskStatus.PENDING, TaskStatus.CLAIMED):
+                raise TaskNotActiveError(channel, task_id)
+            self.conn.execute(
+                "UPDATE tasks SET assignee = ?, updated_at = ? WHERE seq = ?",
+                (assignee, utc_timestamp(now or _utc_now()), current.seq),
+            )
+            return self.by_seq(current.seq)
 
     def _raise_fence_error(self, channel: str, task_id: str) -> None:
         """Distinguish an unknown task from a lost lease for a helpful error."""
@@ -937,6 +991,7 @@ def task_to_dict(task: Task, *, include_payload: bool = True) -> dict:
         "idempotency_key": task.idempotency_key,
         "enqueued_by": task.enqueued_by,
         "worked_by": task.worked_by,
+        "assignee": task.assignee,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
     }
@@ -962,6 +1017,7 @@ def notes_to_dicts(notes: list[TaskNote]) -> list[dict]:
 
 __all__ = [
     "EnqueueResult",
+    "KEEP_ASSIGNEE",
     "MAX_NOTE_BYTES",
     "MAX_NOTE_BYTES_PER_TASK",
     "MAX_NOTES_PER_TASK",

@@ -121,6 +121,15 @@ def validate_consumer(value: Any, limits: ValidationLimits = DEFAULT_LIMITS) -> 
     return _validate_identity(value, "consumer_id", limits.max_consumer_chars)
 
 
+def validate_assignee(
+    value: Any, limits: ValidationLimits = DEFAULT_LIMITS
+) -> str | None:
+    """A task's addressed worker: a consumer name, or None for any worker."""
+    if value is None:
+        return None
+    return _validate_identity(value, "assignee", limits.max_consumer_chars)
+
+
 def validate_title(value: Any, limits: ValidationLimits = DEFAULT_LIMITS) -> str:
     return _validate_identity(value, "title", limits.max_title_chars)
 
