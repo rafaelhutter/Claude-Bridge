@@ -121,6 +121,20 @@ def validate_consumer(value: Any, limits: ValidationLimits = DEFAULT_LIMITS) -> 
     return _validate_identity(value, "consumer_id", limits.max_consumer_chars)
 
 
+MAX_PROGRESS_CHARS = 300
+
+
+def validate_progress(value: Any) -> str | None:
+    """A one-line task status; the empty string clears it (None)."""
+    result = _require_string(value, "progress")
+    if len(result) > MAX_PROGRESS_CHARS:
+        raise BridgeValidationError(
+            "progress", "too_long", f"must be at most {MAX_PROGRESS_CHARS} characters"
+        )
+    _reject_controls(result, "progress")
+    return result.strip() or None
+
+
 def validate_title(value: Any, limits: ValidationLimits = DEFAULT_LIMITS) -> str:
     return _validate_identity(value, "title", limits.max_title_chars)
 

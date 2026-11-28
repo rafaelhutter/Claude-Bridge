@@ -80,6 +80,7 @@ from .participants import (
     parse_usage_report,
 )
 from .task_leases import extend_lease, release_task
+from .task_progress import set_progress
 from .taskqueue import (
     MAX_NOTE_BYTES,
     MAX_NOTE_BYTES_PER_TASK,
@@ -1159,7 +1160,12 @@ async def fail_task_reliable(
 
 
 async def release_task_reliable(
-    *, channel: str, task_id: str, lease_token: str, delay_seconds: int = 0
+    *,
+    channel: str,
+    task_id: str,
+    lease_token: str,
+    delay_seconds: int = 0,
+    progress: str | None = None,
 ) -> TaskWithNotes:
     def release_and_record():
         task = release_task(
@@ -1168,6 +1174,7 @@ async def release_task_reliable(
             task_id=task_id,
             lease_token=lease_token,
             delay_seconds=delay_seconds,
+            progress=progress,
         )
         _record_task_resolution(task)
         return TaskWithNotes(task, task_store().unread_notes(task))
@@ -1178,7 +1185,12 @@ async def release_task_reliable(
 
 
 async def extend_lease_reliable(
-    *, channel: str, task_id: str, lease_token: str, lease_seconds: int
+    *,
+    channel: str,
+    task_id: str,
+    lease_token: str,
+    lease_seconds: int,
+    progress: str | None = None,
 ) -> TaskWithNotes:
     def extend_and_record():
         task = extend_lease(
@@ -1187,6 +1199,7 @@ async def extend_lease_reliable(
             task_id=task_id,
             lease_token=lease_token,
             lease_seconds=lease_seconds,
+            progress=progress,
         )
         participant_store().touch(task.lease_owner)
         return TaskWithNotes(task, task_store().unread_notes(task))
@@ -1195,13 +1208,22 @@ async def extend_lease_reliable(
 
 
 async def add_task_note_reliable(
-    *, channel: str, task_id: str, sender: str, content: str
+    *,
+    channel: str,
+    task_id: str,
+    sender: str,
+    content: str,
+    progress: str | None = None,
 ) -> TaskNote:
     # No waiter wake-up: claim long-polls wait for new tasks, and a note adds none.
     def add_and_record():
         note = task_store().add_note(
             channel=channel, task_id=task_id, sender=sender, content=content
         )
+        if progress is not None:
+            set_progress(
+                task_store(), channel=note.channel, task_id=task_id, progress=progress
+            )
         participant_store().touch(note.sender)
         return note
 
@@ -1790,6 +1812,14 @@ async def list_tools() -> list[Tool]:
                         "maximum": 1000000000,
                         "default": 0,
                     },
+                    "progress": {
+                        "type": "string",
+                        "maxLength": 300,
+                        "description": (
+                            "One-line task status shown in bridge_tasks (not an "
+                            "error); empty string clears it"
+                        ),
+                    },
                 },
                 "required": ["channel", "task_id", "lease_token"],
                 "additionalProperties": False,
@@ -1818,6 +1848,14 @@ async def list_tools() -> list[Tool]:
                     "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
                     "lease_token": {"type": "string", "minLength": 1, "maxLength": 256},
                     "lease_seconds": {"type": "integer", "minimum": 1},
+                    "progress": {
+                        "type": "string",
+                        "maxLength": 300,
+                        "description": (
+                            "One-line task status shown in bridge_tasks (not an "
+                            "error); empty string clears it"
+                        ),
+                    },
                 },
                 "required": ["channel", "task_id", "lease_token"],
                 "additionalProperties": False,
@@ -1932,6 +1970,14 @@ async def list_tools() -> list[Tool]:
                     "task_id": {"type": "string", "minLength": 1, "maxLength": 256},
                     "sender": {"type": "string", "minLength": 1, "maxLength": 128},
                     "content": {"type": "string", "minLength": 1},
+                    "progress": {
+                        "type": "string",
+                        "maxLength": 300,
+                        "description": (
+                            "One-line task status shown in bridge_tasks (not an "
+                            "error); empty string clears it"
+                        ),
+                    },
                 },
                 "required": ["channel", "task_id", "sender", "content"],
                 "additionalProperties": False,
@@ -2402,6 +2448,7 @@ async def dispatch_tool(
                 task_id=arguments["task_id"],
                 lease_token=arguments["lease_token"],
                 delay_seconds=arguments.get("delay_seconds", 0),
+                progress=arguments.get("progress"),
             )
         task, unread = outcome.task, outcome.notes
         return _tool_output(
@@ -2424,6 +2471,7 @@ async def dispatch_tool(
                 task_id=arguments["task_id"],
                 lease_token=arguments["lease_token"],
                 lease_seconds=_clamp_lease_seconds(arguments.get("lease_seconds")),
+                progress=arguments.get("progress"),
             )
         task, unread = outcome.task, outcome.notes
         return _tool_output(
@@ -2474,6 +2522,7 @@ async def dispatch_tool(
             lines.append(
                 f"  {t.id} · {t.status.value} · attempt {t.attempts}/{t.max_attempts}"
                 + (f" · {t.title}" if t.title else "")
+                + (f" · progress: {t.progress}" if t.progress else "")
             )
         return _tool_output(
             "\n".join(lines),
@@ -2493,6 +2542,7 @@ async def dispatch_tool(
                 task_id=arguments["task_id"],
                 sender=arguments["sender"],
                 content=arguments["content"],
+                progress=arguments.get("progress"),
             )
         return _tool_output(
             f"✓ Noted task {note.task_id} on [{note.channel}] (note seq {note.seq})",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from .task_progress import PROGRESS_UPDATE, progress_params
 from .taskqueue import Task, TaskStore
 from .timestamps import as_utc, utc_timestamp
 from .validation import (
@@ -27,10 +28,12 @@ def release_task(
     task_id: str,
     lease_token: str,
     delay_seconds: int = 0,
+    progress: str | None = None,
     now: datetime | None = None,
 ) -> Task:
     """Return a held task to the queue untouched; its claim's attempt is refunded."""
     channel, task_id, lease_token = _lease_reference(channel, task_id, lease_token)
+    keep_progress, new_progress = progress_params(progress)
     delay_seconds = validate_non_negative_int(
         delay_seconds, "delay_seconds", maximum=_MAX_SECONDS
     )
@@ -41,9 +44,15 @@ def release_task(
         store.conn.execute(
             "UPDATE tasks SET status = 'pending', lease_owner = NULL, "
             "lease_token = NULL, lease_expires_at = NULL, "
-            "attempts = MAX(attempts - 1, 0), available_at = ?, updated_at = ? "
-            "WHERE seq = ?",
-            (available_at, utc_timestamp(instant), held.seq),
+            "attempts = MAX(attempts - 1, 0), available_at = ?, updated_at = ?, "
+            f"{PROGRESS_UPDATE} WHERE seq = ?",
+            (
+                available_at,
+                utc_timestamp(instant),
+                keep_progress,
+                new_progress,
+                held.seq,
+            ),
         )
         return store.by_seq(held.seq)
 
@@ -55,10 +64,12 @@ def extend_lease(
     task_id: str,
     lease_token: str,
     lease_seconds: int,
+    progress: str | None = None,
     now: datetime | None = None,
 ) -> Task:
     """Move a held lease's expiry to ``lease_seconds`` from now, without a new claim."""
     channel, task_id, lease_token = _lease_reference(channel, task_id, lease_token)
+    keep_progress, new_progress = progress_params(progress)
     lease_seconds = validate_non_negative_int(
         lease_seconds, "lease_seconds", maximum=_MAX_SECONDS
     )
@@ -69,8 +80,9 @@ def extend_lease(
     with store.write_scope():
         held = store.held_task(channel, task_id, lease_token)
         store.conn.execute(
-            "UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE seq = ?",
-            (expires_at, utc_timestamp(instant), held.seq),
+            "UPDATE tasks SET lease_expires_at = ?, updated_at = ?, "
+            f"{PROGRESS_UPDATE} WHERE seq = ?",
+            (expires_at, utc_timestamp(instant), keep_progress, new_progress, held.seq),
         )
         return store.by_seq(held.seq)
 
