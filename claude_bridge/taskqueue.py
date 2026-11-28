@@ -139,7 +139,7 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _require_text(value: object, field: str, max_bytes: int) -> str:
+def require_text(value: object, field: str, max_bytes: int) -> str:
     """Bounded free-text field (payload/result/error): string, capped, NUL-free."""
     if not isinstance(value, str):
         raise BridgeValidationError(field, "invalid_type", "must be a string")
@@ -418,11 +418,37 @@ class TaskStore:
 
     # -- helpers ----------------------------------------------------------------
 
+    @contextmanager
+    def write_scope(self) -> Iterator[None]:
+        """One atomic store write: the store lock plus a savepoint."""
+        with self._lock, _savepoint(self.conn):
+            yield
+
     def _get(self, channel: str, task_id: str) -> Task | None:
         row = self.conn.execute(
             _TASK_SELECT + "WHERE channel = ? AND id = ?", (channel, task_id)
         ).fetchone()
         return _task_from_row(row) if row is not None else None
+
+    def find(self, channel: str, task_id: str) -> Task | None:
+        return self._get(channel, task_id)
+
+    def by_seq(self, seq: int) -> Task:
+        row = self.conn.execute(_TASK_SELECT + "WHERE seq = ?", (seq,)).fetchone()
+        if row is None:
+            raise TaskQueueError(f"task seq {seq} disappeared inside its write")
+        return _task_from_row(row)
+
+    def held_task(self, channel: str, task_id: str, lease_token: str) -> Task:
+        """The claimed task this lease token still holds, else a fence error."""
+        row = self.conn.execute(
+            _TASK_SELECT + "WHERE id = ? AND channel = ? AND status = 'claimed' "
+            "AND lease_token = ?",
+            (task_id, channel, lease_token),
+        ).fetchone()
+        if row is None:
+            self._raise_fence_error(channel, task_id)
+        return _task_from_row(row)
 
     def _resolve_expired_leases(self, channel: str, instant: str) -> None:
         """Requeue (or dead-letter) leases past their visibility timeout.
@@ -463,7 +489,7 @@ class TaskStore:
         now: datetime | None = None,
     ) -> EnqueueResult:
         channel = validate_channel(channel)
-        payload = _require_text(payload, "payload", DEFAULT_LIMITS.max_message_bytes)
+        payload = require_text(payload, "payload", DEFAULT_LIMITS.max_message_bytes)
         title = _resolve_title(title, payload)
         priority = validate_non_negative_int(priority, "priority", maximum=_MAX_COUNT)
         max_attempts = validate_non_negative_int(
@@ -578,7 +604,7 @@ class TaskStore:
         task_id = validate_reference(task_id, "task_id")
         lease_token = validate_reference(lease_token, "lease_token")
         if result is not None:
-            result = _require_text(result, "result", DEFAULT_LIMITS.max_message_bytes)
+            result = require_text(result, "result", DEFAULT_LIMITS.max_message_bytes)
         now_iso = utc_timestamp(now or _utc_now())
 
         with self._lock, _savepoint(self.conn):
@@ -610,7 +636,7 @@ class TaskStore:
         task_id = validate_reference(task_id, "task_id")
         lease_token = validate_reference(lease_token, "lease_token")
         if error is not None:
-            error = _require_text(error, "error", DEFAULT_LIMITS.max_message_bytes)
+            error = require_text(error, "error", DEFAULT_LIMITS.max_message_bytes)
         retry_delay_seconds = validate_non_negative_int(
             retry_delay_seconds, "retry_delay_seconds", maximum=_MAX_TASK_SECONDS
         )
@@ -618,15 +644,8 @@ class TaskStore:
         now_iso = utc_timestamp(instant)
         available_at = utc_timestamp(instant + timedelta(seconds=retry_delay_seconds))
 
-        with self._lock, _savepoint(self.conn):
-            row = self.conn.execute(
-                _TASK_SELECT + "WHERE id = ? AND channel = ? AND status = 'claimed' "
-                "AND lease_token = ?",
-                (task_id, channel, lease_token),
-            ).fetchone()
-            if row is None:
-                self._raise_fence_error(channel, task_id)
-            current = _task_from_row(row)
+        with self.write_scope():
+            current = self.held_task(channel, task_id, lease_token)
             if requeue and current.attempts < current.max_attempts:
                 self.conn.execute(
                     "UPDATE tasks SET status = 'pending', lease_owner = NULL, "
@@ -641,10 +660,7 @@ class TaskStore:
                     "updated_at = ? WHERE seq = ?",
                     (error, now_iso, current.seq),
                 )
-            updated = self.conn.execute(
-                _TASK_SELECT + "WHERE seq = ?", (current.seq,)
-            ).fetchone()
-            return _task_from_row(updated)
+            return self.by_seq(current.seq)
 
     def add_note(
         self,
@@ -659,7 +675,7 @@ class TaskStore:
         channel = validate_channel(channel)
         task_id = validate_reference(task_id, "task_id")
         sender = validate_sender(sender)
-        content = _require_text(content, "content", MAX_NOTE_BYTES)
+        content = require_text(content, "content", MAX_NOTE_BYTES)
         if not content.strip():
             raise BridgeValidationError("content", "required", "must not be empty")
         note_id = "note_" + uuid.uuid4().hex
@@ -729,15 +745,8 @@ class TaskStore:
         task_id = validate_reference(task_id, "task_id")
         lease_token = validate_reference(lease_token, "lease_token")
 
-        with self._lock, _savepoint(self.conn):
-            row = self.conn.execute(
-                _TASK_SELECT + "WHERE id = ? AND channel = ? AND status = 'claimed' "
-                "AND lease_token = ?",
-                (task_id, channel, lease_token),
-            ).fetchone()
-            if row is None:
-                self._raise_fence_error(channel, task_id)
-            task = _task_from_row(row)
+        with self.write_scope():
+            task = self.held_task(channel, task_id, lease_token)
             new_notes = self.unread_notes(task)
             if new_notes:
                 self.conn.execute(
@@ -765,7 +774,7 @@ class TaskStore:
         channel = validate_channel(channel)
         task_id = validate_reference(task_id, "task_id")
         sender = validate_reference(sender, "sender")
-        payload = _require_text(payload, "payload", DEFAULT_LIMITS.max_message_bytes)
+        payload = require_text(payload, "payload", DEFAULT_LIMITS.max_message_bytes)
         title = _resolve_title(title, payload)
         if priority is not None:
             priority = validate_non_negative_int(priority, "priority", maximum=_MAX_COUNT)
@@ -972,6 +981,7 @@ __all__ = [
     "TaskWithNotes",
     "derive_task_title",
     "ensure_taskqueue_schema",
+    "require_text",
     "note_to_dict",
     "notes_to_dicts",
     "task_to_dict",
