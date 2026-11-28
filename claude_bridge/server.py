@@ -80,6 +80,7 @@ from .participants import (
     parse_usage_report,
 )
 from .task_leases import extend_lease, release_task
+from .task_listing import requested_statuses, task_row
 from .task_progress import set_progress
 from .taskqueue import (
     KEEP_ASSIGNEE,
@@ -1470,6 +1471,7 @@ async def list_tools() -> list[Tool]:
         "maxLength": 120,
         "description": "Short task title; derived from the payload when omitted",
     }
+    task_statuses = [status.value for status in TaskStatus]
     assignee_input = {
         "type": ["string", "null"],
         "minLength": 1,
@@ -1978,21 +1980,39 @@ async def list_tools() -> list[Tool]:
             name="bridge_tasks",
             description=(
                 "Inspect a channel's task queue: per-status counts plus a recent "
-                "task list. Read-only."
+                "task list, newest first. Filter by status (one or a list), "
+                "exclude_terminal, assignee or worked_by; compact=true returns lean "
+                "rows without result. Read-only."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "channel": {"type": "string", "minLength": 1},
                     "status": {
-                        "type": "string",
-                        "enum": [
-                            "pending",
-                            "claimed",
-                            "completed",
-                            "failed",
-                            "dead",
+                        "description": "One status or a list of statuses",
+                        "anyOf": [
+                            {"type": "string", "enum": task_statuses},
+                            {
+                                "type": "array",
+                                "items": {"type": "string", "enum": task_statuses},
+                            },
                         ],
+                    },
+                    "exclude_terminal": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Leave out completed, failed and dead tasks",
+                    },
+                    "assignee": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "worked_by": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "compact": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Rows with only task_id, title, status, priority, "
+                            "attempts, max_attempts, assignee, lease_owner, "
+                            "lease_expires_at, progress"
+                        ),
                     },
                     "limit": {
                         "type": "integer",
@@ -2588,7 +2608,9 @@ async def dispatch_tool(
         counts = store.counts(channel=channel)
         tasks = store.list_tasks(
             channel=channel,
-            status=arguments.get("status"),
+            statuses=requested_statuses(arguments),
+            assignee=arguments.get("assignee"),
+            worked_by=arguments.get("worked_by"),
             limit=normalize_limit(arguments.get("limit"), default=50, maximum=500),
         )
         summary = f"[{channel}] queue — " + ", ".join(
@@ -2607,7 +2629,9 @@ async def dispatch_tool(
             {
                 "channel": channel,
                 "counts": counts,
-                "tasks": [task_to_dict(t, include_payload=False) for t in tasks],
+                "tasks": [
+                    task_row(t, compact=bool(arguments.get("compact"))) for t in tasks
+                ],
             },
             structured=structured,
         )
