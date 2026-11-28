@@ -139,3 +139,14 @@ def test_release_after_reclaim_is_refused(fresh_db):
             store, channel="jobs", task_id=first.id, lease_token=first.lease_token,
             now=at(130),
         )
+
+
+def test_extend_revives_an_expired_lease_nobody_reclaimed(fresh_db):
+    store = bridge.task_store()
+    store.enqueue(channel="jobs", payload="p", now=at(0))
+    task = store.claim(channel="jobs", consumer="w1", lease_seconds=60, now=at(0))
+    extended = extend_lease(
+        store, channel="jobs", task_id=task.id, lease_token=task.lease_token,
+        lease_seconds=60, now=at(90),
+    )
+    assert extended.status is TaskStatus.CLAIMED and extended.attempts == 1
