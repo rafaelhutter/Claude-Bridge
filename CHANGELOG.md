@@ -17,7 +17,7 @@ versioning where the Python packaging format allows.
   and an expired lease use up attempts.
 - **Progress line.** `bridge_extend`, `bridge_release` and `bridge_task_note`
   take an optional `progress` (one line, max 300 chars, empty clears), shown in
-  `bridge_tasks`; `last_error` stays for real failures.
+  `bridge_tasks` and cleared by a new claim; `last_error` stays for real failures.
 - **Lean task listing.** `bridge_tasks` takes `status` as one status or a list,
   `exclude_terminal`, `assignee`, `worked_by`, and `compact=true` for rows
   without `result`.
